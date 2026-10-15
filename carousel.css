@@ -60,6 +60,7 @@ body{
 }
 .bs-az button:hover,.bs-az button:focus{color:var(--gold);outline:1px solid var(--gold-dim)}
 .bs-az button.cur{color:#141005;background:var(--gold);font-weight:700}
+.bs-stats{text-align:center;color:var(--ink-dim);font-size:.84rem;margin:8px auto 0;max-width:1020px;padding:0 12px}
 
 /* ---------- stage ---------- */
 .bs-stage-wrap{position:relative;max-width:1180px;margin:4px auto 0;padding:0 6px}

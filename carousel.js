@@ -37,6 +37,23 @@
   function easeOut(x) { return 1 - Math.pow(1 - x, 3); }
   function easeInOut(x) { return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; }
 
+  /* ---------- display titles (render-time ONLY) ----------
+     Owner correction #3 (2026-10-14): titles as DISPLAYED strip a leading
+     "Made Simple:" / "MADE SIMPLE:" prefix, and HTML entities in the data
+     strings (e.g. "&amp;", "&#x27;") are decoded so they read cleanly.
+     The underlying data titles, sort keys/order, URLs, link targets and
+     cover-image alt source data are NOT changed. */
+  var _decEl = null;
+  function displayTitle(t) {
+    var out = String(t == null ? "" : t);
+    if (out.indexOf("&") !== -1) {
+      if (!_decEl) _decEl = document.createElement("textarea");
+      _decEl.innerHTML = out;
+      out = _decEl.value;
+    }
+    return out.replace(/^\s*made simple:\s*/i, "");
+  }
+
   /* ---------- state ---------- */
   var state = {
     coll: "all",
@@ -53,6 +70,7 @@
       if (!(s in slugColl)) slugColl[s] = c.id;
     });
   });
+  var totalBooks = Object.keys(DATA.books).length;
   var totalCovers = Object.keys(DATA.books).filter(function (s) { return DATA.books[s].img; }).length;
 
   /* ---------- pool of cover nodes ---------- */
@@ -88,11 +106,15 @@
     var center = Math.round(state.position);
     for (var i = 0; i < POOL_N; i++) {
       var node = pool[i], idx = center + i - POOL_R;
-      if (idx < 0 || idx >= n) { node.style.display = "none"; node._idx = -1; continue; }
+      if (idx < 0 || idx >= n) { node.style.display = "none"; node._idx = -1; node._slug = null; node.classList.remove("is-center"); delete node.dataset.slug; continue; }
       var off = idx - state.position;
-      if (node._idx !== idx) {
-        var slug = state.list[idx], b = DATA.books[slug];
-        node._idx = idx; node.dataset.slug = slug;
+      var slugNow = state.list[idx];
+      if (node._idx !== idx || node._slug !== slugNow) {
+        /* keyed by SLUG as well as index: after a collection switch an
+           index can coincide while the book changes — the node must take
+           the new book's cover, never keep the previous collection's. */
+        var slug = slugNow, b = DATA.books[slug];
+        node._idx = idx; node._slug = slug; node.dataset.slug = slug;
         var img = node.firstChild;
         if (img.getAttribute("src") !== b.img) img.setAttribute("src", b.img);
         img.alt = b.t + " — book cover";
@@ -112,10 +134,11 @@
     if (center !== lastCenter && n > 0) {
       lastCenter = center;
       var cb = DATA.books[state.list[center]];
-      capTitle.textContent = cb.t;
+      capTitle.textContent = displayTitle(cb.t);
       capTitle.setAttribute("href", PAGE_BASE + cb.u);
       var coll = DATA.collections.filter(function (c) { return c.id === state.coll; })[0];
-      capMeta.textContent = "Book " + (center + 1) + " of " + n + " · " + (coll ? coll.label : "");
+      capMeta.textContent = "Book " + (center + 1) + " of " + n + " covers on the shelf · " +
+        (coll ? coll.label : "") + ": " + state.fullList.length + " books · " + n + " with covers";
       markLetter();
     }
   }
@@ -338,20 +361,54 @@
     });
   }
 
-  /* ---------- collections ---------- */
-  function setCollection(id, startIdx) {
+  /* ---------- collections ----------
+     Fix #2 (Muse 3, 2026-10-14): a collection switch must never show the
+     previous collection's covers under the new caption (or vice versa).
+     The new collection's initial window is PRELOADED first; only then are
+     state, covers and caption swapped together in one synchronous commit,
+     so every painted frame is internally consistent. A token discards
+     superseded switches. A timeout fallback commits anyway so a slow
+     network can never wedge the shelf. */
+  var switchToken = 0;
+  function preloadWindow(list, pos) {
+    var ps = [];
+    for (var i = Math.max(0, pos - POOL_R); i <= Math.min(list.length - 1, pos + POOL_R); i++) {
+      var src = DATA.books[list[i]].img;
+      if (!src) continue;
+      ps.push(new Promise(function (res) {
+        var im = new Image(), done = false;
+        function fin() { if (!done) { done = true; res(); } }
+        im.onload = fin; im.onerror = fin;
+        im.src = src;
+        if (im.complete) fin();
+        setTimeout(fin, 1800);
+      }));
+    }
+    return Promise.race([Promise.all(ps),
+      new Promise(function (r) { setTimeout(r, 2000); })]);
+  }
+  function setCollection(id, startIdx, after) {
     stopMotion();
-    state.coll = id;
-    state.fullList = DATA.order[id] || [];
-    state.list = state.fullList.filter(function (s) { return DATA.books[s].img; });
-    state.position = clamp(startIdx || 0, 0, Math.max(0, state.list.length - 1));
-    lastCenter = -1;
-    buildAz(); render(); updateHud();
-    if (state.view === "simple") renderSimple(false);
+    var token = ++switchToken;
+    var newFull = DATA.order[id] || [];
+    var newList = newFull.filter(function (s) { return DATA.books[s].img; });
+    var pos = clamp(startIdx || 0, 0, Math.max(0, newList.length - 1));
+    return preloadWindow(newList, pos).then(function () {
+      if (token !== switchToken) return;   // a newer switch superseded this one
+      state.coll = id;
+      state.fullList = newFull;
+      state.list = newList;
+      state.position = pos;
+      lastCenter = -1;
+      buildAz(); render(); updateHud();
+      if (state.view === "simple") renderSimple(false);
+      if (after) after();
+    });
   }
   DATA.collections.forEach(function (c) {
     var o = document.createElement("option");
-    o.value = c.id; o.textContent = c.label + " (" + c.count + ")";
+    o.value = c.id;
+    o.textContent = c.label + " (" + c.count + " books · " + c.withCovers + " with covers)";
     catSel.appendChild(o);
   });
   catSel.addEventListener("change", function () { setCollection(catSel.value, 0); });
@@ -379,7 +436,7 @@
       var b = DATA.books[s];
       var btn = document.createElement("button");
       btn.type = "button"; btn.setAttribute("role", "option");
-      var left = document.createElement("span"); left.textContent = b.t + (b.img ? "" : " (no cover yet)");
+      var left = document.createElement("span"); left.textContent = displayTitle(b.t) + (b.img ? "" : " (no cover yet)");
       var right = document.createElement("span"); right.className = "r-coll";
       var coll = DATA.collections.filter(function (c) { return c.id === slugColl[s]; })[0];
       right.textContent = coll ? coll.label : "";
@@ -408,7 +465,11 @@
     if (state.list.indexOf(slug) === -1) {
       var targetColl = (DATA.order.all || []).indexOf(slug) !== -1 ? "all" : slugColl[slug];
       catSel.value = targetColl;
-      setCollection(targetColl, 0);
+      setCollection(targetColl, 0, function () {
+        jumpTo(state.list.indexOf(slug));
+        stage.focus();
+      });
+      return;
     }
     jumpTo(state.list.indexOf(slug));
     stage.focus();
@@ -429,11 +490,11 @@
         a.appendChild(img);
       } else {
         var tx = document.createElement("span");
-        tx.className = "bs-cell-text"; tx.textContent = b.t;
+        tx.className = "bs-cell-text"; tx.textContent = displayTitle(b.t);
         a.appendChild(tx);
       }
       var cap = document.createElement("span");
-      cap.className = "c-title"; cap.textContent = b.t;
+      cap.className = "c-title"; cap.textContent = displayTitle(b.t);
       a.appendChild(cap);
       simpleGrid.appendChild(a);
     }
@@ -469,11 +530,22 @@
   motionToggle.addEventListener("change", applyMotion);
 
   /* ---------- HUD (preview instrumentation) ---------- */
+  function statsText() {
+    var coll = DATA.collections.filter(function (c) { return c.id === state.coll; })[0];
+    var missing = state.fullList.length - state.list.length;
+    return totalBooks + " books in the catalog · " + totalCovers + " with covers" +
+      " — now showing " + (coll ? coll.label : "") + ": " + state.fullList.length +
+      " books · " + state.list.length + " with covers on the shelf" +
+      (missing > 0 ? " · " + missing + " without a cover (Simple view, as a text tile)" : "");
+  }
   function updateHud() {
     var coll = DATA.collections.filter(function (c) { return c.id === state.coll; })[0];
-    hud.textContent = "Preview stats · catalog: " + totalCovers + " covers · shelf window: " +
-      Math.min(POOL_N, state.list.length) + " of " + state.list.length +
-      " in " + (coll ? coll.label : "") + " · cover images loaded so far: " + loadedSrcs.size;
+    hud.textContent = "Preview stats · catalog: " + totalBooks + " books · " + totalCovers +
+      " covers · shelf window: " + Math.min(POOL_N, state.list.length) + " of " +
+      state.list.length + " in " + (coll ? coll.label : "") +
+      " · cover images loaded so far: " + loadedSrcs.size;
+    var st = $("bsStats");
+    if (st) st.textContent = statsText();
   }
 
   /* ---------- init ---------- */
@@ -492,6 +564,7 @@
     velocity: function () { return spin ? spin.vel : 0; },
     spinning: function () { return !!spin; },
     lastFling: function () { return lastFling; },
+    displayTitle: displayTitle,
     momentum: { MIN: SPIN_MIN, MAX: SPIN_MAX, K: SPIN_K, SETTLE: SETTLE_VEL }
   };
 })();
