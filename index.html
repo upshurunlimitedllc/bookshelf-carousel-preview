@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Bookshelf — 3D Cover Carousel Preview · kimaniupshur.com</title>
+<link rel="stylesheet" href="carousel.css">
+</head>
+<body>
+<header class="bs-head">
+  <div class="bs-brand">Upshur Unlimited, LLC</div>
+  <h1>The Bookshelf</h1>
+  <p class="bs-sub">Browse the bookstore by cover — swipe the shelf, tap a book to open it.</p>
+  <p class="bs-preview-note">Design preview only · not live on kimaniupshur.com</p>
+</header>
+
+<div class="bs-controls" role="search">
+  <label class="bs-field">
+    <span>Collection</span>
+    <select id="catSel" aria-label="Choose a collection"></select>
+  </label>
+  <label class="bs-field bs-grow">
+    <span>Search titles</span>
+    <input id="searchBox" type="search" autocomplete="off" placeholder="Type a title — e.g. Prayer"
+           aria-label="Search book titles" aria-expanded="false" aria-controls="searchResults">
+  </label>
+  <div class="bs-toggles">
+    <button id="viewToggle" type="button" aria-pressed="false">Simple view</button>
+    <label class="bs-check"><input type="checkbox" id="motionToggle"> Reduce motion</label>
+  </div>
+  <div id="searchResults" class="bs-results" role="listbox" aria-label="Search results" hidden></div>
+</div>
+
+<nav class="bs-az" id="azBar" aria-label="Jump to a letter"></nav>
+
+<main>
+  <section class="bs-stage-wrap" id="carouselWrap">
+    <button class="bs-arrow" id="prevBtn" type="button" aria-label="Previous book">&#8249;</button>
+    <div class="bs-stage" id="stage" tabindex="0" role="region"
+         aria-roledescription="carousel" aria-label="Book cover carousel. Use arrow keys or swipe to browse."></div>
+    <button class="bs-arrow" id="nextBtn" type="button" aria-label="Next book">&#8250;</button>
+    <div class="bs-caption">
+      <a id="capTitle" href="#">—</a>
+      <div id="capMeta" aria-live="polite"></div>
+      <div class="bs-hint">Tap the centered cover to open its book page</div>
+    </div>
+  </section>
+
+  <section class="bs-simple" id="simpleView" hidden aria-label="Simple list view">
+    <div class="bs-grid" id="simpleGrid"></div>
+    <button id="moreBtn" type="button">Show more</button>
+  </section>
+</main>
+
+<footer class="bs-foot">
+  <div id="hud" class="bs-hud" aria-hidden="true"></div>
+  <p>Every cover is the book&rsquo;s real artwork. Books without cover artwork yet appear in the simple view as title links. All purchase options live on each book&rsquo;s page, unchanged.</p>
+</footer>
+
+<script src="books-data.js"></script>
+<script src="carousel.js"></script>
+</body>
+</html>
