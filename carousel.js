@@ -3,7 +3,11 @@
    angled away with rotateY + translateZ. Only a window of covers around the
    current position exists in the DOM / is ever requested (pool of 17 nodes
    recycled as the shelf moves), so a catalog of ~1,000 books costs ~17
-   thumbnail downloads at a time, never hundreds of full-size covers. */
+   thumbnail downloads at a time, never hundreds of full-size covers.
+   Flick physics: releasing a drag above a velocity threshold hands the
+   shelf's release velocity to a momentum integrator (exponential friction);
+   it coasts, decelerates, and eases into an exact centred stop. Touching
+   the shelf grabs it dead. Reduced-motion settings disable spinning. */
 (function () {
   "use strict";
   var DATA = window.BOOKSHELF_DATA;
@@ -116,30 +120,80 @@
     }
   }
 
-  /* ---------- animation ---------- */
-  var anim = null, rafId = null;
-  function step(now) {
+  /* ---------- animation: eased tweens + physics momentum ----------
+     Two drivers share one RAF loop and are mutually exclusive:
+     · tween — eased moves for buttons / keyboard / search / A–Z, and the
+       final settle that parks a spin on an exact book.
+     · spin — velocity-based momentum after a flick. Velocity is measured in
+       books/second; friction is an exponential decay (vel *= e^(−K·dt)), so
+       a flick's coasting distance ≈ v/K books and even the hardest flick
+       dies within a few seconds. When |vel| falls below SETTLE_VEL the
+       shelf eases the remaining fraction of a book into a centred stop.
+       Position is always an index into the (alphabetical) list, so order
+       can never scramble, spin or not. */
+  var SPIN_MIN = 4.0;      // books/sec at release required to enter a spin
+  var SPIN_MAX = 34;       // books/sec cap on any flick
+  var SPIN_K = 1.05;       // friction: exponential velocity decay per second
+  var SETTLE_VEL = 0.85;   // books/sec where momentum hands over to the settle ease
+  var anim = null, spin = null, rafId = null;
+  function ensureRaf() { if (!rafId) rafId = requestAnimationFrame(frame); }
+  function stopMotion() {
+    anim = null; spin = null;
+    capMeta.setAttribute("aria-live", "polite");
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  }
+  function frame(now) {
     rafId = null;
-    if (!anim) return;
-    var t = (now - anim.start) / anim.dur;
-    if (t >= 1) { state.position = anim.to; anim = null; render(); return; }
-    var e = anim.ease(t);
-    state.position = anim.from + (anim.to - anim.from) * e;
-    render();
-    rafId = requestAnimationFrame(step);
+    if (anim) {
+      var t = (now - anim.start) / anim.dur;
+      if (t >= 1) { state.position = anim.to; anim = null; render(); return; }
+      var e = anim.ease(t);
+      state.position = anim.from + (anim.to - anim.from) * e;
+      render();
+      rafId = requestAnimationFrame(frame);
+      return;
+    }
+    if (spin) {
+      var dt = Math.min(0.1, (now - spin.last) / 1000);   // clamp tab-switch gaps
+      spin.last = now;
+      if (dt > 0) {
+        var n = state.list.length;
+        state.position += spin.vel * dt;
+        spin.vel *= Math.exp(-SPIN_K * dt);
+        if (state.position <= 0) { state.position = 0; spin.vel = 0; }        // ends clamp:
+        else if (state.position >= n - 1) { state.position = n - 1; spin.vel = 0; }
+        render();
+      }
+      if (Math.abs(spin.vel) < SETTLE_VEL) {
+        spin = null;
+        capMeta.setAttribute("aria-live", "polite");
+        tweenTo(Math.round(state.position));
+      } else rafId = requestAnimationFrame(frame);
+    }
+  }
+  function startSpin(v) {
+    anim = null;
+    spin = { vel: clamp(v, -SPIN_MAX, SPIN_MAX), last: performance.now() };
+    /* mid-spin the caption would change many times a second; keep assistive
+       tech from queueing dozens of stale announcements */
+    capMeta.setAttribute("aria-live", "off");
+    ensureRaf();
   }
   function tweenTo(target, opts) {
     opts = opts || {};
     target = clamp(target, 0, state.list.length - 1);
+    spin = null;
+    capMeta.setAttribute("aria-live", "polite");
     if (state.reduced) { anim = null; state.position = target; render(); return; }
     var dist = Math.abs(target - state.position);
     if (dist < 0.001) { state.position = target; render(); return; }
     var dur = opts.dur || clamp(240 + dist * 55, 240, 780);
     anim = { from: state.position, to: target, start: performance.now(), dur: dur,
              ease: opts.ease || easeOut };
-    if (!rafId) rafId = requestAnimationFrame(step);
+    ensureRaf();
   }
   function jumpTo(target) {  // long-distance move (A-Z, search)
+    stopMotion();
     var dist = Math.abs(target - state.position);
     if (dist > 30 && !state.reduced) {
       /* Fade-teleport: a rotating sweep across hundreds of titles would make
@@ -162,7 +216,7 @@
   var drag = null;
   stage.addEventListener("pointerdown", function (e) {
     if (e.button !== undefined && e.button > 0) return;
-    anim = null; if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    stopMotion();   // grab-to-stop: touching the shelf kills any spin/tween instantly
     var node = e.target.closest ? e.target.closest(".bk") : null;
     drag = { x0: e.clientX, t0: performance.now(), startPos: state.position,
              samples: [{ x: e.clientX, t: performance.now() }],
@@ -172,21 +226,58 @@
   stage.addEventListener("pointermove", function (e) {
     if (!drag) return;
     var m = metrics();
-    var dx = e.clientX - drag.x0;
-    drag.moved = Math.max(drag.moved, Math.abs(dx));
-    drag.samples.push({ x: e.clientX, t: performance.now() });
-    if (drag.samples.length > 8) drag.samples.shift();
+    /* Browsers coalesce fast finger movement into one pointermove per frame;
+       the raw positions ride along via getCoalescedEvents(). Recording every
+       raw position keeps the drag tracking (and the travel that the release
+       velocity is estimated from) truthful for fast flicks. Samples are
+       stamped with handler time: event.timeStamp proved unreliable (a
+       constant 0) for some injected-input pipelines. */
+    var evs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
+    var dx = 0, now = performance.now();
+    for (var i = 0; i < evs.length; i++) {
+      dx = evs[i].clientX - drag.x0;
+      drag.moved = Math.max(drag.moved, Math.abs(dx));
+      drag.samples.push({ x: evs[i].clientX, t: now });
+      if (drag.samples.length > 24) drag.samples.shift();
+    }
     var pos = drag.startPos - dx / m.spacing;
     if (pos < 0) pos *= 0.35;                                  // rubber-band
     if (pos > state.list.length - 1) pos = state.list.length - 1 + (pos - (state.list.length - 1)) * 0.35;
     state.position = pos;
     render();
   });
+  /* Release velocity of a finished drag, in books/second (signed, + = forward).
+     Estimated from the last ~100 ms of movement only, and read as zero if the
+     finger paused before lifting — a flick-and-hold must not spin. */
+  var lastFling = { v: 0, samples: 0, spanMs: 0 };
+  function dragVelocity(d, now) {
+    var s = d.samples;
+    if (s.length < 2) return 0;
+    var last = s[s.length - 1];
+    if (now - last.t > 60) return 0;
+    var a = last;
+    for (var i = s.length - 1; i >= 0; i--) {
+      if (last.t - s[i].t <= 100) a = s[i]; else break;
+    }
+    d.winSpan = last.t - a.t;
+    if (last.t - a.t < 16) return 0;
+    return -((last.x - a.x) / (last.t - a.t)) * 1000 / metrics().spacing;
+  }
+  /* No-spin release: land on the nearest book — except that a deliberate
+     gentle swipe (the finger clearly travelled, the shelf barely moved)
+     still turns exactly one page. */
+  function settleFromDrag(d) {
+    var startIdx = Math.round(d.startPos);
+    var target = Math.round(state.position);
+    if (target === startIdx && Math.abs(state.position - d.startPos) >= 0.18)
+      target = startIdx + (state.position > d.startPos ? 1 : -1);
+    tweenTo(target);
+  }
   function endDrag(e) {
     if (!drag) return;
     var d = drag; drag = null;
-    var dt = performance.now() - d.t0;
-    if (d.moved < 9 && dt < 500) {                              // tap
+    var now = performance.now();
+    if (d.moved < 9 && now - d.t0 < 500) {                      // tap
       if (d.nodeIdx >= 0) {
         if (d.nodeIdx === Math.round(state.position)) {
           var slug = state.list[d.nodeIdx];
@@ -195,17 +286,14 @@
       }
       return;
     }
-    var m = metrics(), v = 0;                                   // px per ms
-    if (d.samples.length > 1) {
-      var a = d.samples[0], b = d.samples[d.samples.length - 1];
-      if (b.t > a.t) v = (b.x - a.x) / (b.t - a.t);
-    }
-    var vIdx = -(v / m.spacing) * 1000;                         // covers per second
-    var target = Math.round(state.position + vIdx * 0.22);
-    tweenTo(target);
+    if (!state.list.length) return;
+    var v = dragVelocity(d, now);
+    lastFling = { v: v, samples: d.samples.length, spanMs: Math.round(d.winSpan || 0) };
+    if (!state.reduced && Math.abs(v) >= SPIN_MIN) { startSpin(v); return; }
+    settleFromDrag(d);
   }
   stage.addEventListener("pointerup", endDrag);
-  stage.addEventListener("pointercancel", function () { drag = null; tweenTo(Math.round(state.position)); });
+  stage.addEventListener("pointercancel", function () { drag = null; stopMotion(); tweenTo(Math.round(state.position)); });
 
   /* ---------- buttons & keyboard ---------- */
   prevBtn.addEventListener("click", function () { tweenTo(Math.round(state.position) - 1); });
@@ -252,6 +340,7 @@
 
   /* ---------- collections ---------- */
   function setCollection(id, startIdx) {
+    stopMotion();
     state.coll = id;
     state.fullList = DATA.order[id] || [];
     state.list = state.fullList.filter(function (s) { return DATA.books[s].img; });
@@ -370,7 +459,10 @@
   function applyMotion() {
     state.reduced = motionToggle.checked;
     document.body.classList.toggle("reduced-motion", state.reduced);
-    if (state.reduced && anim) { state.position = anim.to; anim = null; render(); }
+    if (state.reduced && (anim || spin)) {
+      state.position = anim ? anim.to : Math.round(state.position);
+      stopMotion(); render();
+    }
   }
   motionToggle.checked = window.matchMedia &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -394,5 +486,12 @@
   setCollection(initColl, isNaN(initPos) ? 0 : initPos);
   if (params.get("view") === "simple") setView("simple");
   window.addEventListener("resize", function () { render(); });
-  window.__bookshelf = { state: state, jumpTo: jumpTo, tweenTo: tweenTo, setCollection: setCollection };
+  window.__bookshelf = {
+    state: state, jumpTo: jumpTo, tweenTo: tweenTo, setCollection: setCollection,
+    stopMotion: stopMotion,
+    velocity: function () { return spin ? spin.vel : 0; },
+    spinning: function () { return !!spin; },
+    lastFling: function () { return lastFling; },
+    momentum: { MIN: SPIN_MIN, MAX: SPIN_MAX, K: SPIN_K, SETTLE: SETTLE_VEL }
+  };
 })();
